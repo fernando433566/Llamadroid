@@ -16,3 +16,16 @@ llama/build
 llama/vendor
 /ollama
 integration/testdata/models/
+
+# Local Flutter/Android outputs for the standalone Android app
+/ollama-app-for-Android-/.dart_tool/
+/ollama-app-for-Android-/.flutter-plugins-dependencies
+/ollama-app-for-Android-/build/
+/ollama-app-for-Android-/.idea/
+/ollama-app-for-Android-/android/.gradle/
+/ollama-app-for-Android-/android/.kotlin/
+/ollama-app-for-Android-/android/build/
+/ollama-app-for-Android-/android/app/.cxx/
+/ollama-app-for-Android-/android/local.properties
+/ollama-app-for-Android-/android/app/src/main/java/
+/ollama-app-for-Android-/windows/flutter/ephemeral/
