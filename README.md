@@ -16,12 +16,11 @@
 - [Whisper](https://github.com/openai/whisper) and [Nvidia-parkeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
 - [Supertonic](https://github.com/supertone-inc/supertonic)
 
-  (i hope i havent forgoten anyone)
+  (i hope i havent forgotten anyone)
 # Minimun requirements
 - Android 15
 - a phone
 - [a dream](https://www.youtube.com/watch?v=YFOhH_3Zfs8) (everithing is a JOJO reference)
-<iframe width="560" height="315" src="https://www.youtube.com/watch?v=YFOhH_3Zfs8" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
 
 # What does this ap do?
  This app can:
