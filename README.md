@@ -15,6 +15,7 @@
 - [Google AI edge Gallery](https://github.com/google-ai-edge/gallery)
 - [Whisper](https://github.com/openai/whisper) and [Nvidia-parkeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
 - [Supertonic](https://github.com/supertone-inc/supertonic)
+
   (i hope i havent forgoten anyone)
 # Minimun requirements
 - Android 15
