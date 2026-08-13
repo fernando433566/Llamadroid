@@ -27,4 +27,6 @@
 - Run Ollama or GGUF models on your device via GPU (Vulkan), CPU, NPU (only whith HTP v73 or up) or if you are feeling brave using two or tree of the processing units at the same time
 - Run models from local servers or ollama cloud
 - Connect various devices via internet to form a RAG, wich, not only can unify devices into an unique device, but can also split the multimodal layers to other devices
-- Use the app as an assistant with functions like calling, writing emails, searching the web, giving you toilet paper when you run out of it... you name it, you got it because you can make your own functions
+- Use the app as an assistant with functions like using the cams, capturing the screen, calling, writing emails, searching the web, giving you toilet paper when you run out of it... you name it, you got it because you can even make your own functions
+- Device actions can be trigered without the AI been used, and you can slap any customization of words to trigger the automatization
+- in the menu of advanced options, you can expose the phone as a Ollama web server (GGUF models imported included), Activate the embedded audio feature for some models (To add this feature navigate to the top-rigth corner of the chat interface to see the selected model configuration, were you can use this option if your model supports it), and more features
