@@ -607,18 +607,6 @@ class _ScreenAssistantState extends State<ScreenAssistant> {
                   border: const OutlineInputBorder())),
           _sectionTitle(appText("Voice and interaction", "Voz e interacción")),
           _capability("voiceSession"),
-          ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: const Icon(Icons.hearing_rounded),
-              title: Text(appText("Wake-up word (not enabled)",
-                  "Wake-up word (no habilitado)")),
-              subtitle: Text(appText(
-                  "Use the system assistant gesture. Continuous listening requires a persistent microphone service and a microWakeWord-compatible runtime; it is not enabled silently.",
-                  "Usa el gesto de asistente del sistema. La escucha continua requeriría un servicio de micrófono permanente y un runtime compatible con microWakeWord; no se activa silenciosamente.")),
-              trailing: const Icon(Icons.open_in_new_rounded),
-              onTap: () => launchUrl(
-                  Uri.parse("https://github.com/OHF-Voice/micro-wake-word"),
-                  mode: LaunchMode.externalApplication)),
           DropdownButtonFormField<String>(
               initialValue: sttEngine,
               decoration: InputDecoration(
