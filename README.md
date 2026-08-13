@@ -22,9 +22,9 @@
 - a phone
 - [a dream](https://www.youtube.com/watch?v=YFOhH_3Zfs8) (everithing is a JOJO reference)
 
-# What does this ap do?
+# What does this app do?
  This app can:
-- Run Ollama or GGUF models via GPU (Vulkan), CPU, NPU (only whith HTP v73 or up) or if you are feeling brave using two or tree of the processing units at the same time
+- Run Ollama or GGUF models on your device via GPU (Vulkan), CPU, NPU (only whith HTP v73 or up) or if you are feeling brave using two or tree of the processing units at the same time
 - Run models from local servers or ollama cloud
 - Connect various devices via internet to form a RAG, wich, not only can unify devices into an unique device, but can also split the multimodal layers to other devices
 - Use the app as an assistant with functions like calling, writing emails, searching the web, giving you toilet paper when you run out of it... you name it, you got it because you can make your own functions
