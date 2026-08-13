@@ -39,6 +39,11 @@ type LlmRequest struct {
 	// evict-all-and-retry. Prevents infinite retry on persistent load failures.
 	oomRetryAttempted bool
 
+	// gpuFallbackAttempted is set when an Android Vulkan runner fails to load.
+	// Mobile Vulkan support varies by driver, so retry once on CPU while keeping
+	// the GPU as the preferred first attempt.
+	gpuFallbackAttempted bool
+
 	// numCtxAuto is true when NumCtx came from Ollama's automatic VRAM-tier
 	// default rather than explicit request, model, or environment config.
 	numCtxAuto bool
@@ -318,7 +323,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					// every unload, then loop back to retry the load once.
 					// load() has already set oomRetryAttempted so a second
 					// crash falls through to the fail-fast path.
-					if pending.oomRetryAttempted {
+					if pending.oomRetryAttempted || pending.gpuFallbackAttempted {
 						if !s.evictAllAndWait(ctx, pendingKey) {
 							return
 						}
@@ -532,6 +537,24 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				return false
 			}
 
+			// The bundled Android client encodes explicit Synergy CPU/GPU mode as
+			// -1000 minus the requested GPU percentage. The inclusive endpoints
+			// intentionally permit 100% CPU and 100% GPU/RPC-cluster placement.
+			if runtime.GOOS == "android" {
+				gpuPercent, gpuLayers, ok := androidSynergyGPULayers(
+					req.opts.NumGPU,
+					int(f.KV().BlockCount()+1),
+				)
+				if ok {
+					req.opts.NumGPU = gpuLayers
+					slog.Warn("using experimental simultaneous Android CPU/GPU mode",
+						"model", req.model.ModelPath,
+						"gpu_percent", gpuPercent,
+						"gpu_layers", req.opts.NumGPU,
+						"total_layers", int(f.KV().BlockCount()+1))
+				}
+			}
+
 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
@@ -667,6 +690,17 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			slog.Warn("llama-server load failed; evicting all other models and retrying once", "model", req.model.ModelPath, "error", err)
 			return true
 		}
+		if runtime.GOOS == "android" && len(loadGpus) > 0 && req.opts.NumGPU < 0 && !req.gpuFallbackAttempted {
+			req.gpuFallbackAttempted = true
+			req.opts.NumGPU = 0
+			slog.Warn("Android GPU model load failed; retrying once on CPU",
+				"model", req.model.ModelPath,
+				"gpu_library", loadGpus[0].Library,
+				"loaded_count", loadedCount,
+				"evict_all", otherLoaded,
+				"error", err)
+			return true
+		}
 
 		req.errCh <- err
 		return false
@@ -752,6 +786,19 @@ iGPUScan:
 	}()
 
 	return false
+}
+
+// androidSynergyGPULayers decodes the private Android request range
+// -1000..-1100 into an exact static GPU-layer count. Keeping this conversion
+// outside the UI makes the 0% and 100% endpoints independently testable.
+func androidSynergyGPULayers(encoded, totalLayers int) (gpuPercent, gpuLayers int, ok bool) {
+	if encoded > -1000 || encoded < -1100 || totalLayers < 0 {
+		return 0, 0, false
+	}
+
+	gpuPercent = -encoded - 1000
+	gpuLayers = (totalLayers*gpuPercent + 50) / 100
+	return gpuPercent, min(max(gpuLayers, 0), totalLayers), true
 }
 
 func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *ggml.GGML, numParallel int, completion bool, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, launchOpts api.Options) (oldNumCtx, effectiveNumCtx, newNumCtx, oldNumBatch, newNumBatch int, ok bool) {

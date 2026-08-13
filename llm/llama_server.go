@@ -379,6 +379,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	params = appendMTPDraftArgs(params, launch.config, launch.opts)
 
 	params = append(params, qwenVLServerArgs(launch.modelArch)...)
+	params = appendRPCArgs(params, os.Getenv("OLLAMA_RPC_SERVERS"))
 
 	// LoRA adapters
 	for _, adapter := range launch.adapters {
@@ -434,6 +435,29 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		return nil, 0, err
 	}
 	return cmd, port, nil
+}
+
+// appendRPCArgs enables llama.cpp's experimental RPC backend when Ollama is
+// started with OLLAMA_RPC_SERVERS. Invalid endpoints are ignored so a stale
+// mobile setting cannot prevent every local model from starting.
+func appendRPCArgs(params []string, raw string) []string {
+	endpoints := make([]string, 0)
+	for _, candidate := range strings.Split(raw, ",") {
+		candidate = strings.TrimSpace(candidate)
+		host, port, err := net.SplitHostPort(candidate)
+		if err != nil || strings.TrimSpace(host) == "" {
+			continue
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			continue
+		}
+		endpoints = append(endpoints, net.JoinHostPort(host, strconv.Itoa(portNumber)))
+	}
+	if len(endpoints) == 0 {
+		return params
+	}
+	return append(params, "--rpc", strings.Join(endpoints, ","))
 }
 
 // SetupLlamaServerCommandEnv configures the environment for a llama-server
@@ -868,7 +892,14 @@ func NewLlamaServerRunner(
 		"nemotron_h_omni": true,
 		// Add entries as llama/compat grows clip handlers.
 	}
+	// Inline projectors can reserve several GiB even for a text-only request.
+	// An explicit false keeps the text tensors available while deferring the
+	// projector until a request that actually contains media arrives.
+	if opts.LoadVision != nil && !*opts.LoadVision {
+		projectors = nil
+	}
 	if len(projectors) == 0 &&
+		(opts.LoadVision == nil || *opts.LoadVision) &&
 		len(f.Tensors().Items("v.")) > 0 &&
 		compatClipArches[arch] {
 		projectors = []string{modelPath}
@@ -2129,6 +2160,9 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 		"presence_penalty":  req.Options.PresencePenalty,
 		"typical_p":         req.Options.TypicalP,
 		"seed":              req.Options.Seed,
+	}
+	if req.Options.ReasoningBudget >= 0 {
+		body["thinking_budget_tokens"] = req.Options.ReasoningBudget
 	}
 	if len(req.Tools) > 0 {
 		body["tools"] = req.Tools

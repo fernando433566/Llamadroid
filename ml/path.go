@@ -88,6 +88,11 @@ func libOllamaPathCandidates(search libOllamaPathSearch) []string {
 		case "windows":
 			add(filepath.Join(exeDir, "lib", "ollama"))
 			add(filepath.Join(exeDir, "..", "lib", "ollama"))
+		case "android":
+			// Android apps keep native libraries in the same dir as the binary or a 'lib' peer
+			add(exeDir)
+			add(filepath.Join(exeDir, "lib"))
+			add(filepath.Join(exeDir, "..", "lib"))
 		default:
 			add(filepath.Join(exeDir, "lib", "ollama"))
 			add(filepath.Join(exeDir, "..", "lib", "ollama"))

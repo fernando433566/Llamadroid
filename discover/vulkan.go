@@ -52,7 +52,23 @@ var probeLlamaServerVulkanDevices = func(_ []string) ([]vulkanPhysicalDevice, er
 
 func refineLlamaServerDevices(devices []ml.DeviceInfo, libDirs []string) []ml.DeviceInfo {
 	devices = refineLinuxROCmDevices(devices)
-	return refineWindowsVulkanDevices(devices, libDirs)
+	devices = refineWindowsVulkanDevices(devices, libDirs)
+	return refineAndroidVulkanDevices(devices)
+}
+
+func refineAndroidVulkanDevices(devices []ml.DeviceInfo) []ml.DeviceInfo {
+	if runtime.GOOS != "android" {
+		return devices
+	}
+
+	for i := range devices {
+		if devices[i].Library == "Vulkan" {
+			// Android GPUs (Adreno, Mali) are integrated
+			devices[i].Integrated = true
+		}
+	}
+
+	return devices
 }
 
 func refineWindowsVulkanDevices(devices []ml.DeviceInfo, libDirs []string) []ml.DeviceInfo {

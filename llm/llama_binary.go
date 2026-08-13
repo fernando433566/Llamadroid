@@ -104,6 +104,11 @@ func llamaCppBinaryCandidates(name string, search llamaCppBinarySearch) []string
 			add(filepath.Join(base, "lib", "ollama"))
 			// Standard CMake installs put ollama.exe in bin/ and helpers in ../lib/ollama/.
 			add(filepath.Join(base, "..", "lib", "ollama"))
+		case "android":
+			// Android apps keep native libraries in the same dir as the binary or a 'lib' peer
+			add(base)
+			add(filepath.Join(base, "lib"))
+			add(filepath.Join(base, "..", "lib"))
 		default:
 			add(filepath.Join(base, "lib", "ollama"))
 			add(filepath.Join(base, "..", "lib", "ollama"))
@@ -159,6 +164,12 @@ func llamaCppBinaryCandidates(name string, search llamaCppBinarySearch) []string
 func llamaCppBinaryName(name, goos string) string {
 	if goos == "windows" && filepath.Ext(name) == "" {
 		return name + ".exe"
+	}
+	if goos == "android" && filepath.Ext(name) == "" {
+		// Android 10+ blocks execution from writable app data. Packaging helper
+		// executables as JNI libraries keeps them in the executable native library
+		// directory selected by PackageManager for the device ABI.
+		return "lib" + strings.ReplaceAll(name, "-", "_") + "_exec.so"
 	}
 	return name
 }

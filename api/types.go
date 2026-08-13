@@ -572,6 +572,7 @@ type Options struct {
 	NumKeep          int      `json:"num_keep,omitempty"`
 	Seed             int      `json:"seed,omitempty"`
 	NumPredict       int      `json:"num_predict,omitempty"`
+	ReasoningBudget  int      `json:"reasoning_budget,omitempty"`
 	TopK             int      `json:"top_k,omitempty"`
 	TopP             float32  `json:"top_p,omitempty"`
 	MinP             float32  `json:"min_p,omitempty"`
@@ -593,6 +594,10 @@ type Runner struct {
 	UseMMap         *bool `json:"use_mmap,omitempty"`
 	NumThread       int   `json:"num_thread,omitempty"`
 	DraftNumPredict int   `json:"draft_num_predict,omitempty"`
+	// LoadVision controls whether a multimodal projector is loaded. It is used
+	// by memory-constrained clients that want the text portion of an inline
+	// vision model without reserving the projector until an image is sent.
+	LoadVision *bool `json:"load_vision,omitempty"`
 }
 
 // EmbedRequest is the request passed to [Client.Embed].

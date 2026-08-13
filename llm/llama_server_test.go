@@ -3689,6 +3689,39 @@ func testGGMLTensor(name string, kind ggml.TensorType, shape []uint64) *ggml.Ten
 	return tensor
 }
 
+func TestAppendRPCArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{name: "disabled", raw: "", want: []string{"base"}},
+		{
+			name: "valid workers",
+			raw:  "192.168.1.20:50052, worker.local:6000",
+			want: []string{"base", "--rpc", "192.168.1.20:50052,worker.local:6000"},
+		},
+		{
+			name: "invalid entries are ignored",
+			raw:  "missing-port,host:0,host:70000,10.0.0.3:50052",
+			want: []string{"base", "--rpc", "10.0.0.3:50052"},
+		},
+		{
+			name: "ipv6",
+			raw:  "[fd00::42]:50052",
+			want: []string{"base", "--rpc", "[fd00::42]:50052"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := appendRPCArgs([]string{"base"}, tt.raw); !slices.Equal(got, tt.want) {
+				t.Fatalf("appendRPCArgs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // fakeRunningCmd returns an exec.Cmd that looks like it's still running
 // (ProcessState is nil, which is the case before Wait() completes).
 // Registers cleanup via t.Cleanup to prevent zombie processes.
