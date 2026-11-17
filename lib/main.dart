@@ -458,14 +458,28 @@ Object activeKeepAlive() {
   return "5m";
 }
 
+/// Returns the user's value for [key] (per model first, then global), or null
+/// when the user never set it.
+Object? _userSamplingPreference(String key) {
+  final selectedModel = model;
+  if (selectedModel != null &&
+      prefs?.containsKey("$key:$selectedModel") == true) {
+    return prefs?.get("$key:$selectedModel");
+  }
+  return prefs?.get(key);
+}
+
 Map<String, dynamic> activeChatOptions({bool? loadVision}) {
   final options = <String, dynamic>{
-    "temperature": _modelDoublePreference("chatTemperature",
-        prefs?.getDouble("chatTemperature") ?? defaultChatTemperature),
-    "top_p": _modelDoublePreference(
-        "chatTopP", prefs?.getDouble("chatTopP") ?? defaultChatTopP),
-    "top_k": _modelIntPreference(
-        "chatTopK", prefs?.getInt("chatTopK") ?? defaultChatTopK),
+    // Sampling is only sent when the user changed it. Otherwise the model's
+    // own recommended values apply (e.g. LFM models need temperature 0.1;
+    // forcing 0.8 makes them ramble and never finish thinking).
+    for (final (key, option) in const [
+      ("chatTemperature", "temperature"),
+      ("chatTopP", "top_p"),
+      ("chatTopK", "top_k"),
+    ])
+      if (_userSamplingPreference(key) case final value?) option: value,
     "num_predict": _modelIntPreference("chatMaxTokens",
         prefs?.getInt("chatMaxTokens") ?? defaultChatMaxTokens),
     "num_ctx": _modelIntPreference("chatContextTokens",
@@ -627,13 +641,10 @@ Future<bool> startConfiguredLocalServer() => ServerController.startServer(
     computeMode: configuredComputeMode(),
     forcedDevice: configuredForcedDevice(),
     rpcServers: configuredRpcServersForCluster(),
-    multimodalBackendDevice: configuredClusterMultimodalBackend(),
-    synergyCpuPercent: prefs?.getInt("synergyCpuPercent") ??
-        (100 - (prefs?.getInt("synergyGpuPercent") ?? 50)),
-    synergyGpuPercent: prefs?.getInt("synergyGpuPercent") ?? 50,
-    synergyNpuPercent: prefs?.getBool("synergyNpuEnabled") ?? false
-        ? (prefs?.getInt("synergyNpuPercent") ?? 0)
-        : 0);
+    // The Synergy CPU/GPU split is not a server setting: it travels with each
+    // request as num_gpu (see activeComputeOptions), so moving the slider
+    // never restarts the server or reloads the model.
+    multimodalBackendDevice: configuredClusterMultimodalBackend());
 
 Map<String, dynamic> activeChatRequest(List<llama.Message> history, bool stream,
     {bool? thinkingOverride}) {
@@ -1130,6 +1141,9 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
         "chatTopP", prefs?.getDouble("chatTopP") ?? defaultChatTopP);
     var topK = _modelIntPreference(
         "chatTopK", prefs?.getInt("chatTopK") ?? defaultChatTopK);
+    // Remember what was shown, so saving only stores sampling values the user
+    // actually changed (unchanged ones keep following the model's defaults).
+    final shownSampling = (temperature, topP, topK);
     var maxTokens = _modelIntPreference("chatMaxTokens",
         prefs?.getInt("chatMaxTokens") ?? defaultChatMaxTokens);
     var contextTokens = _modelIntPreference("chatContextTokens",
@@ -1394,11 +1408,25 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                             );
                             return;
                           }
-                          await prefs?.setDouble(
-                              "chatTemperature:$selectedModel", temperature);
-                          await prefs?.setDouble(
-                              "chatTopP:$selectedModel", topP);
-                          await prefs?.setInt("chatTopK:$selectedModel", topK);
+                          bool changedOrSet(
+                                  String key, Object shown, Object now) =>
+                              shown != now ||
+                              prefs!.containsKey("$key:$selectedModel");
+                          if (changedOrSet("chatTemperature", shownSampling.$1,
+                              temperature)) {
+                            await prefs?.setDouble(
+                                "chatTemperature:$selectedModel", temperature);
+                          }
+                          if (changedOrSet(
+                              "chatTopP", shownSampling.$2, topP)) {
+                            await prefs?.setDouble(
+                                "chatTopP:$selectedModel", topP);
+                          }
+                          if (changedOrSet(
+                              "chatTopK", shownSampling.$3, topK)) {
+                            await prefs?.setInt(
+                                "chatTopK:$selectedModel", topK);
+                          }
                           await prefs?.setInt(
                               "chatMaxTokens:$selectedModel", maxTokens);
                           await prefs?.setInt(
@@ -3490,6 +3518,12 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                         (prefs!.getString("requestType") ?? "stream") ==
                             "stream";
                     if (streaming) {
+                      // Redrawing the chat (and re-parsing its Markdown) for
+                      // every token steals CPU from the model and drains the
+                      // battery. Repaint at most every 80 ms instead; the
+                      // final chunk is always painted.
+                      final repaintTimer = Stopwatch()..start();
+                      var vibrated = false;
                       await for (final chunk in generateChatStreamRaw(history,
                               thinkingOverride: thinkingOverride)
                           .timeout(activeInferenceTimeout())) {
@@ -3503,10 +3537,20 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                             .toString();
                         text += (responseMessage["content"] ?? "").toString();
                         final done = chunk["done"] == true;
+                        if (!done && repaintTimer.elapsedMilliseconds < 80) {
+                          continue;
+                        }
+                        repaintTimer.reset();
                         renderGeneration(text, thinkingText,
                             isThinking: !done && text.trim().isEmpty);
-                        HapticFeedback.lightImpact();
+                        if (!vibrated && text.isNotEmpty) {
+                          // One tap when the answer starts, not one per token.
+                          HapticFeedback.lightImpact();
+                          vibrated = true;
+                        }
                       }
+                      // Paint whatever arrived after the last repaint.
+                      renderGeneration(text, thinkingText, isThinking: false);
                     } else {
                       final response = await generateChatRaw(history,
                           thinkingOverride: thinkingOverride);

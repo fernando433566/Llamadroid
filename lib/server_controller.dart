@@ -10,11 +10,7 @@ class ServerController {
       String forcedDevice = "gpu",
       String rpcServers = "",
       String multimodalBackendDevice = "",
-      int synergyCpuPercent = 50,
-      int synergyGpuPercent = 50,
-      int synergyNpuPercent = 0,
-      bool forceCpuSafe = false,
-      bool loadVision = false}) async {
+      bool forceCpuSafe = false}) async {
     try {
       final bool result = await _channel.invokeMethod('startServer', {
         'maxLoadedModels': maxLoadedModels,
@@ -23,11 +19,7 @@ class ServerController {
         'forcedDevice': forcedDevice,
         'rpcServers': rpcServers,
         'multimodalBackendDevice': multimodalBackendDevice,
-        'synergyCpuPercent': synergyCpuPercent,
-        'synergyGpuPercent': synergyGpuPercent,
-        'synergyNpuPercent': synergyNpuPercent,
         'forceCpuSafe': forceCpuSafe,
-        'loadVision': loadVision,
       });
       return result;
     } on PlatformException catch (e) {

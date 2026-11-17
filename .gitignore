@@ -41,3 +41,15 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Ollama build workspace (ollama-android/build.sh)
+/ollama-android/work/
+
+# Android build output
+/android/build/
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/android/key.properties
+*.jks
+*.keystore

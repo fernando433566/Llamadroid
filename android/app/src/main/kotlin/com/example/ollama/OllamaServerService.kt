@@ -1,22 +1,50 @@
 package com.example.ollama
 
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.content.Intent
-import android.os.IBinder
+import android.content.SharedPreferences
 import android.os.Build
+import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.File
-import android.util.Log
 import kotlin.concurrent.thread
 
+/**
+ * Foreground service that runs the bundled `ollama serve` process.
+ *
+ * Flutter starts it through MainActivity ("startServer") with the user's
+ * settings as intent extras. The settings are also saved, so when Android
+ * restarts the service by itself (START_STICKY, no extras) the server comes
+ * back with the same configuration.
+ *
+ * Starting it again with the same settings does nothing; with different
+ * settings the server is restarted.
+ */
 class OllamaServerService : Service() {
-    private val processLock = Any()
+
+    /** Everything that changes how the server process is launched. */
+    private data class ServerConfig(
+        val maxLoadedModels: Int,      // < 0 means "no limit"
+        val exposeToLan: Boolean,      // listen on 0.0.0.0 instead of localhost
+        val computeMode: String,       // adaptive | gpu_only | cpu_only | forced | synergy | hybrid
+        val forcedDevice: String,      // used when computeMode == "forced"
+        val forceCpuSafe: Boolean,     // one-shot "run on CPU" recovery switch
+        val rpcServers: String,        // "host:port,host:port" cluster workers
+        val multimodalBackend: String, // where vision/audio projectors run
+    )
+
+    private val lock = Any()
     private var process: Process? = null
-    private var processGeneration = 0
-    private var processStarting = false
-    private var activeConfiguration: String? = null
-    private val NOTIFICATION_ID = 1
-    private val CHANNEL_ID = "ollama_server_channel"
+    private var activeConfig: ServerConfig? = null
+    private var starting = false
+
+    /** Bumped on every start/stop so a stale launcher thread can tell it lost. */
+    private var generation = 0
 
     override fun onCreate() {
         super.onCreate()
@@ -24,264 +52,15 @@ class OllamaServerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action
-        if (action == "STOP") {
+        if (intent?.action == ACTION_STOP) {
             stopServer()
             stopSelf()
             return START_NOT_STICKY
         }
 
         startForeground(NOTIFICATION_ID, createNotification())
-        val servicePreferences = getSharedPreferences("ollama_server", MODE_PRIVATE)
-        val maxLoadedModels = if (intent?.hasExtra("maxLoadedModels") == true) {
-            intent.getIntExtra("maxLoadedModels", 1).also {
-                servicePreferences.edit().putInt("maxLoadedModels", it).apply()
-            }
-        } else {
-            servicePreferences.getInt("maxLoadedModels", 1)
-        }
-        val exposeToLan = if (intent?.hasExtra("exposeToLan") == true) {
-            intent.getBooleanExtra("exposeToLan", false).also {
-                servicePreferences.edit().putBoolean("exposeToLan", it).apply()
-            }
-        } else {
-            servicePreferences.getBoolean("exposeToLan", false)
-        }
-        val computeMode = if (intent?.hasExtra("computeMode") == true) {
-            (intent.getStringExtra("computeMode") ?: "adaptive").also {
-                servicePreferences.edit().putString("computeMode", it).apply()
-            }
-        } else {
-            servicePreferences.getString("computeMode", "adaptive") ?: "adaptive"
-        }
-        val forceCpuSafe = intent?.getBooleanExtra("forceCpuSafe", false) ?: false
-        val forcedDevice = intent?.getStringExtra("forcedDevice") ?: "gpu"
-        val rpcServers = if (intent?.hasExtra("rpcServers") == true) {
-            (intent.getStringExtra("rpcServers") ?: "").also {
-                servicePreferences.edit().putString("rpcServers", it).apply()
-            }
-        } else {
-            servicePreferences.getString("rpcServers", "") ?: ""
-        }
-        val multimodalBackendDevice =
-            if (intent?.hasExtra("multimodalBackendDevice") == true) {
-                (intent.getStringExtra("multimodalBackendDevice") ?: "").also {
-                    servicePreferences.edit().putString("multimodalBackendDevice", it).apply()
-                }
-            } else {
-                servicePreferences.getString("multimodalBackendDevice", "") ?: ""
-            }
-        val synergyCpuPercent = intent?.getIntExtra("synergyCpuPercent", 50) ?: 50
-        val synergyGpuPercent = intent?.getIntExtra("synergyGpuPercent", 50) ?: 50
-        val synergyNpuPercent = intent?.getIntExtra("synergyNpuPercent", 0) ?: 0
-        startServer(maxLoadedModels, exposeToLan, computeMode, forcedDevice, forceCpuSafe, rpcServers,
-            multimodalBackendDevice,
-            synergyCpuPercent, synergyGpuPercent, synergyNpuPercent)
-
+        startServer(readConfig(intent))
         return START_STICKY
-    }
-
-    private fun startServer(
-        maxLoadedModels: Int,
-        exposeToLan: Boolean,
-        computeMode: String,
-        forcedDevice: String,
-        forceCpuSafe: Boolean,
-        rpcServers: String,
-        multimodalBackendDevice: String,
-        synergyCpuPercent: Int,
-        synergyGpuPercent: Int,
-        synergyNpuPercent: Int
-    ) {
-        val disableVulkan = isAndroidEmulator() ||
-            computeMode == "cpu_only" ||
-            (computeMode == "forced" && forcedDevice != "gpu") ||
-            forceCpuSafe ||
-            (computeMode != "gpu_only" && hasKnownUnstableVulkanDriver())
-        val configuration = "$maxLoadedModels:$exposeToLan:$computeMode:$forcedDevice:$disableVulkan:$rpcServers:" +
-            "$multimodalBackendDevice:" +
-            "$synergyCpuPercent:$synergyGpuPercent:$synergyNpuPercent"
-        val generation = synchronized(processLock) {
-            if ((processStarting || process?.isAlive == true) &&
-                activeConfiguration == configuration) {
-                Log.i("OllamaService", "Server is already running with the requested configuration")
-                return
-            }
-            if (processStarting || process?.isAlive == true) {
-                Log.i("OllamaService", "Restarting server because its configuration changed")
-                process?.destroy()
-                process = null
-            }
-            processStarting = true
-            processGeneration += 1
-            activeConfiguration = configuration
-            processGeneration
-        }
-        thread {
-            var startedProcess: Process? = null
-            try {
-                val nativeDir = File(applicationInfo.nativeLibraryDir)
-                val ollamaBin = File(nativeDir, "libollama_exec.so")
-                
-                if (!ollamaBin.exists()) {
-                    Log.e("OllamaService", "Ollama binary not found at ${ollamaBin.absolutePath}")
-                    synchronized(processLock) {
-                        if (processGeneration == generation) processStarting = false
-                    }
-                    stopSelf()
-                    return@thread
-                }
-
-                val pb = ProcessBuilder(ollamaBin.absolutePath, "serve")
-                pb.directory(filesDir)
-                pb.redirectErrorStream(true)
-                
-                val modelsDir = File(filesDir, "models").apply { mkdirs() }
-                val env = pb.environment()
-                env["OLLAMA_MODELS"] = modelsDir.absolutePath
-                env["OLLAMA_HOST"] = if (exposeToLan) "0.0.0.0:11434" else "127.0.0.1:11434"
-                env["OLLAMA_NO_CLOUD"] = "1"
-                env["OLLAMA_IGPU_ENABLE"] = "1"
-                // Mobile devices share RAM between CPU and GPU. The user can
-                // choose a strict resident-model limit or an effectively
-                // unlimited value from Flutter settings.
-                env["OLLAMA_MAX_LOADED_MODELS"] = if (maxLoadedModels < 0) {
-                    Int.MAX_VALUE.toString()
-                } else {
-                    maxLoadedModels.toString()
-                }
-                // Prefer Vulkan layer offload on real phones, but avoid flash
-                // attention kernels that are still unreliable on some Android
-                // Vulkan drivers. The server retries failed GPU loads on CPU.
-                env["OLLAMA_FLASH_ATTENTION"] = "0"
-                env["OLLAMA_LOAD_TIMEOUT"] = "10m"
-                if (!disableVulkan && isQualcommSoc()) {
-                    // Adreno GPUs share physical memory with the CPU. Let the
-                    // Vulkan allocator use system memory if a device-local
-                    // allocation is rejected by the Android driver.
-                    env["GGML_VK_ALLOW_SYSMEM_FALLBACK"] = "1"
-                    if (hasKnownUnstableVulkanDriver()) {
-                        // Conservative override for explicit GPU diagnostics
-                        // on affected Tab S8 firmware. Adaptive mode stays on
-                        // CPU until that driver can complete a model load.
-                        env["GGML_VK_DISABLE_ASYNC"] = "1"
-                        env["GGML_VK_DISABLE_COOPMAT"] = "1"
-                        env["GGML_VK_DISABLE_COOPMAT2"] = "1"
-                    }
-                    Log.i("OllamaService", "Enabled Qualcomm/Adreno Vulkan compatibility profile")
-                }
-                if (rpcServers.isNotBlank()) {
-                    env["OLLAMA_RPC_SERVERS"] = rpcServers
-                } else {
-                    env.remove("OLLAMA_RPC_SERVERS")
-                }
-                val resolvedMultimodalBackend = when (multimodalBackendDevice) {
-                    "LOCAL_CPU" -> "CPU"
-                    "LOCAL_GPU" -> if (disableVulkan) "CPU" else "Vulkan0"
-                    "LOCAL_NPU" -> "HTP0"
-                    else -> multimodalBackendDevice
-                }
-                if (resolvedMultimodalBackend.isNotBlank()) {
-                    // libmtmd supports selecting a concrete ggml device by
-                    // name. This keeps native audio/vision projection on the
-                    // selected host or exact RPC worker instead of relying on
-                    // whichever GPU happens to register first.
-                    env["MTMD_BACKEND_DEVICE"] = resolvedMultimodalBackend
-                } else {
-                    env.remove("MTMD_BACKEND_DEVICE")
-                }
-                if (computeMode == "synergy") {
-                    env["OLLAMA_SYNERGY_CPU_PERCENT"] = synergyCpuPercent.coerceIn(0, 100).toString()
-                    env["OLLAMA_SYNERGY_GPU_PERCENT"] = synergyGpuPercent.coerceIn(0, 100).toString()
-                    env["OLLAMA_SYNERGY_NPU_PERCENT"] = synergyNpuPercent.coerceIn(0, 100).toString()
-                }
-                if (disableVulkan) {
-                    // The Android emulator exposes SwiftShader as a Vulkan GPU.
-                    // llama.cpp can discover it, but model allocation crashes in
-                    // the emulator driver. Keep real devices on Vulkan and use
-                    // the reliable CPU backend only in virtual devices.
-                    env["GGML_VK_VISIBLE_DEVICES"] = "-1"
-                    Log.i(
-                        "OllamaService",
-                        "Vulkan disabled for stable CPU inference; model=${Build.MODEL}; computeMode=$computeMode"
-                    )
-                }
-                val htpDir = File(filesDir, "snapdragon-htp")
-                val htpRuntimePresent = File(nativeDir, "libggml-htp.so").exists() &&
-                    File(nativeDir, "libhtp_ops.so").exists() &&
-                    File(htpDir, "libhtp_ops_skel.so").exists()
-                if (htpRuntimePresent) {
-                    // FastRPC loads the Hexagon skeleton through this path.
-                    // Vendor library paths are required for libcdsprpc.so on
-                    // Qualcomm firmware and are only added for an HTP build.
-                    env["DSP_LIBRARY_PATH"] = htpDir.absolutePath
-                    env["LD_LIBRARY_PATH"] =
-                        "${nativeDir.absolutePath}:/vendor/lib64:/system/lib64"
-                } else {
-                    env["LD_LIBRARY_PATH"] = nativeDir.absolutePath
-                }
-                env["HOME"] = filesDir.absolutePath
-                
-                Log.i(
-                    "OllamaService",
-                    "Starting server from ${ollamaBin.absolutePath}; host=${env["OLLAMA_HOST"]}; maxLoadedModels=${env["OLLAMA_MAX_LOADED_MODELS"]}"
-                )
-                val launchedProcess = pb.start()
-                startedProcess = launchedProcess
-                val accepted = synchronized(processLock) {
-                    if (processGeneration == generation) {
-                        process = launchedProcess
-                        processStarting = false
-                        true
-                    } else {
-                        false
-                    }
-                }
-                if (!accepted) {
-                    launchedProcess.destroy()
-                    return@thread
-                }
-
-                launchedProcess.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { Log.i("OllamaServer", it) }
-                }
-                
-                val exitCode = launchedProcess.waitFor()
-                Log.i("OllamaService", "Server stopped with exit code $exitCode")
-                val shouldStop = synchronized(processLock) {
-                    if (processGeneration == generation && process === launchedProcess) {
-                        process = null
-                        true
-                    } else {
-                        false
-                    }
-                }
-                if (shouldStop) stopSelf()
-            } catch (e: Exception) {
-                Log.e("OllamaService", "Failed to start server", e)
-                val shouldStop = synchronized(processLock) {
-                    if (processGeneration == generation) {
-                        if (process === startedProcess) process = null
-                        processStarting = false
-                        true
-                    } else {
-                        false
-                    }
-                }
-                if (shouldStop) stopSelf()
-            }
-        }
-    }
-
-    private fun stopServer() {
-        val running = synchronized(processLock) {
-            processGeneration += 1
-            processStarting = false
-            val current = process
-            process = null
-            current
-        }
-        running?.destroy()
     }
 
     override fun onDestroy() {
@@ -291,62 +70,217 @@ class OllamaServerService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun isAndroidEmulator(): Boolean {
-        return Build.FINGERPRINT.startsWith("generic") ||
-            Build.FINGERPRINT.contains("emulator", ignoreCase = true) ||
-            Build.MODEL.contains("Emulator", ignoreCase = true) ||
-            Build.MODEL.contains("Android SDK built for", ignoreCase = true) ||
-            Build.HARDWARE.contains("goldfish", ignoreCase = true) ||
-            Build.HARDWARE.contains("ranchu", ignoreCase = true)
+    // ---------------------------------------------------------------------
+    // Configuration
+    // ---------------------------------------------------------------------
+
+    /** Reads each setting from the intent if present, else from the last saved value. */
+    private fun readConfig(intent: Intent?): ServerConfig {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val editor = prefs.edit()
+
+        fun int(key: String, default: Int): Int =
+            if (intent?.hasExtra(key) == true) intent.getIntExtra(key, default).also { editor.putInt(key, it) }
+            else prefs.getInt(key, default)
+
+        fun bool(key: String, default: Boolean): Boolean =
+            if (intent?.hasExtra(key) == true) intent.getBooleanExtra(key, default).also { editor.putBoolean(key, it) }
+            else prefs.getBoolean(key, default)
+
+        fun string(key: String, default: String): String =
+            if (intent?.hasExtra(key) == true) (intent.getStringExtra(key) ?: default).also { editor.putString(key, it) }
+            else prefs.getString(key, default) ?: default
+
+        val config = ServerConfig(
+            maxLoadedModels = int("maxLoadedModels", 1),
+            exposeToLan = bool("exposeToLan", false),
+            computeMode = string("computeMode", "adaptive"),
+            forcedDevice = string("forcedDevice", "gpu"),
+            // Not saved: after a crash-restart we want to try the GPU again.
+            forceCpuSafe = intent?.getBooleanExtra("forceCpuSafe", false) ?: false,
+            rpcServers = string("rpcServers", ""),
+            multimodalBackend = string("multimodalBackendDevice", ""),
+        )
+        editor.apply()
+        return config
     }
 
-    private fun isQualcommSoc(): Boolean {
-        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}"
-        } else {
-            ""
+    /** True when every GPU must be hidden from llama.cpp and everything runs on the CPU. */
+    private fun ServerConfig.gpuDisabled(): Boolean =
+        DeviceQuirks.isEmulator() ||
+            computeMode == "cpu_only" ||
+            (computeMode == "forced" && forcedDevice != "gpu") ||
+            forceCpuSafe
+
+    /** Environment variables for `ollama serve`. */
+    private fun buildEnvironment(config: ServerConfig, env: MutableMap<String, String>) {
+        val nativeDir = File(applicationInfo.nativeLibraryDir)
+        val cpuOnly = config.gpuDisabled()
+        val qualcomm = DeviceQuirks.isQualcomm()
+        val libraryPath = mutableListOf(nativeDir.absolutePath)
+
+        env["HOME"] = filesDir.absolutePath
+        env["GIN_MODE"] = "release" // no per-route debug spam in logcat
+        env["OLLAMA_MODELS"] = File(filesDir, "models").apply { mkdirs() }.absolutePath
+        env["OLLAMA_HOST"] = if (config.exposeToLan) "0.0.0.0:11434" else "127.0.0.1:11434"
+        env["OLLAMA_NO_CLOUD"] = "1"
+        env["OLLAMA_LOAD_TIMEOUT"] = "10m"
+        env["OLLAMA_MAX_LOADED_MODELS"] =
+            if (config.maxLoadedModels < 0) Int.MAX_VALUE.toString() else config.maxLoadedModels.toString()
+
+        // Phones share one pool of RAM between CPU and GPU.
+        env["OLLAMA_IGPU_ENABLE"] = "1"
+        // Every parallel slot reserves its own KV cache. A phone serves one chat
+        // at a time, so a single slot saves a lot of RAM.
+        env["OLLAMA_NUM_PARALLEL"] = "1"
+        // Flash attention kernels are still unreliable on mobile GPU drivers.
+        env["OLLAMA_FLASH_ATTENTION"] = "0"
+
+        // GPU backend choice:
+        //  - Qualcomm Adreno: OpenCL. Adreno drivers fail to build llama.cpp's
+        //    Vulkan pipelines (vkCreateComputePipeline -> ErrorUnknown), while
+        //    the OpenCL backend is maintained by Qualcomm for these GPUs.
+        //    libggml-opencl.so needs the phone's /vendor/lib64/libOpenCL.so.
+        //  - Everything else (Mali, Xclipse, PowerVR...): Vulkan.
+        //  - CPU-only modes: hide Vulkan and don't expose the OpenCL driver.
+        if (cpuOnly || qualcomm) {
+            env["GGML_VK_VISIBLE_DEVICES"] = "-1"
         }
-        return Regex(
-            "qualcomm|qcom|snapdragon|sm[0-9]{4}|kalama|pineapple",
-            RegexOption.IGNORE_CASE
-        ).containsMatchIn("$soc ${Build.HARDWARE} ${Build.BOARD} ${Build.DEVICE}")
+        if (!cpuOnly && qualcomm) {
+            libraryPath += "/vendor/lib64"
+        }
+        if (!cpuOnly && !qualcomm) {
+            // Fall back to system memory if a device-local allocation is refused.
+            env["GGML_VK_ALLOW_SYSMEM_FALLBACK"] = "1"
+        }
+        Log.i(TAG, "GPU backend: ${when { cpuOnly -> "none (CPU)"; qualcomm -> "OpenCL"; else -> "Vulkan" }}; " +
+            "model=${Build.MODEL}; computeMode=${config.computeMode}")
+
+        setOrRemove(env, "OLLAMA_RPC_SERVERS", config.rpcServers)
+
+        // libmtmd can pin the vision/audio projector to a specific ggml device.
+        val projectorDevice = when (config.multimodalBackend) {
+            "LOCAL_CPU" -> "CPU"
+            "LOCAL_GPU" -> when { cpuOnly -> "CPU"; qualcomm -> "GPUOpenCL"; else -> "Vulkan0" }
+            "LOCAL_NPU" -> "HTP0"
+            else -> config.multimodalBackend // a cluster worker, e.g. "RPC0"
+        }
+        setOrRemove(env, "MTMD_BACKEND_DEVICE", projectorDevice)
+
+        // Snapdragon NPU (Hexagon) runtime, only present in HTP builds.
+        val htpDir = File(filesDir, "snapdragon-htp")
+        val hasHtp = File(nativeDir, "libggml-htp.so").exists() &&
+            File(nativeDir, "libhtp_ops.so").exists() &&
+            File(htpDir, "libhtp_ops_skel.so").exists()
+        if (hasHtp) {
+            env["DSP_LIBRARY_PATH"] = htpDir.absolutePath
+            libraryPath += listOf("/vendor/lib64", "/system/lib64")
+        }
+
+        env["LD_LIBRARY_PATH"] = libraryPath.distinct().joinToString(":")
     }
 
-    /**
-     * Samsung's Android 16 firmware for the Tab S8 family currently crashes
-     * the bundled llama.cpp Vulkan backend while allocating model tensors,
-     * even for a request with zero GPU layers. Adaptive mode therefore starts
-     * on CPU on these devices instead of returning a misleading Request Fail.
-     * GPU-only remains available as an explicit diagnostic/override.
-     */
-    private fun hasKnownUnstableVulkanDriver(): Boolean {
-        val normalizedModel = Build.MODEL.uppercase().replace("_", "-")
-        return Build.MANUFACTURER.equals("samsung", ignoreCase = true) &&
-            (normalizedModel.startsWith("SM-X700") ||
-                normalizedModel.startsWith("SM-X800") ||
-                normalizedModel.startsWith("SM-X900"))
+    private fun setOrRemove(env: MutableMap<String, String>, key: String, value: String) {
+        if (value.isNotBlank()) env[key] = value else env.remove(key)
     }
+
+    // ---------------------------------------------------------------------
+    // Process lifecycle
+    // ---------------------------------------------------------------------
+
+    private fun startServer(config: ServerConfig) {
+        val myGeneration = synchronized(lock) {
+            val running = starting || process?.isAlive == true
+            if (running && activeConfig == config) {
+                Log.i(TAG, "Server already running with this configuration")
+                return
+            }
+            if (running) {
+                Log.i(TAG, "Configuration changed; restarting server")
+                process?.destroy()
+                process = null
+            }
+            starting = true
+            activeConfig = config
+            ++generation
+        }
+
+        // Starting a process and reading its output blocks, so do it off the main thread.
+        thread(name = "ollama-server") { runServer(config, myGeneration) }
+    }
+
+    private fun runServer(config: ServerConfig, myGeneration: Int) {
+        val binary = File(applicationInfo.nativeLibraryDir, "libollama_exec.so")
+        if (!binary.exists()) {
+            Log.e(TAG, "Ollama binary not found at ${binary.absolutePath}")
+            finish(myGeneration, null)
+            return
+        }
+
+        var launched: Process? = null
+        try {
+            val builder = ProcessBuilder(binary.absolutePath, "serve")
+                .directory(filesDir)
+                .redirectErrorStream(true)
+            buildEnvironment(config, builder.environment())
+
+            Log.i(TAG, "Starting server; host=${builder.environment()["OLLAMA_HOST"]}")
+            launched = builder.start()
+
+            val stillWanted = synchronized(lock) {
+                (generation == myGeneration).also { if (it) { process = launched; starting = false } }
+            }
+            if (!stillWanted) {
+                launched.destroy()
+                return
+            }
+
+            // Forward server output to logcat (tag "OllamaServer") until it exits.
+            launched.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { Log.i(SERVER_LOG_TAG, it) }
+            }
+            Log.i(TAG, "Server stopped with exit code ${launched.waitFor()}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start server", e)
+        }
+        finish(myGeneration, launched)
+    }
+
+    /** Clears state after the server process ended, unless a newer start took over. */
+    private fun finish(myGeneration: Int, ended: Process?) {
+        val isCurrent = synchronized(lock) {
+            (generation == myGeneration).also {
+                if (it) {
+                    if (process === ended) process = null
+                    starting = false
+                }
+            }
+        }
+        if (isCurrent) stopSelf()
+    }
+
+    private fun stopServer() {
+        val running = synchronized(lock) {
+            generation++
+            starting = false
+            activeConfig = null
+            process.also { process = null }
+        }
+        running?.destroy()
+    }
+
+    // ---------------------------------------------------------------------
+    // Notification
+    // ---------------------------------------------------------------------
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "Ollama Server Channel",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(serviceChannel)
-        }
+        val channel = NotificationChannel(CHANNEL_ID, "Ollama Server Channel", NotificationManager.IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
     private fun createNotification(): Notification {
-        val stopIntent = Intent(this, OllamaServerService::class.java).apply {
-            action = "STOP"
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 0, stopIntent,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
-        )
+        val stopIntent = Intent(this, OllamaServerService::class.java).setAction(ACTION_STOP)
+        val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Ollama Server")
@@ -354,5 +288,31 @@ class OllamaServerService : Service() {
             .setSmallIcon(android.R.drawable.ic_media_play)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
             .build()
+    }
+
+    companion object {
+        const val ACTION_STOP = "STOP"
+        private const val TAG = "OllamaService"
+        private const val SERVER_LOG_TAG = "OllamaServer"
+        private const val PREFS_NAME = "ollama_server"
+        private const val NOTIFICATION_ID = 1
+        private const val CHANNEL_ID = "ollama_server_channel"
+    }
+}
+
+/** Device detection used to pick safe GPU settings. */
+object DeviceQuirks {
+    fun isEmulator(): Boolean =
+        Build.FINGERPRINT.startsWith("generic") ||
+            Build.FINGERPRINT.contains("emulator", ignoreCase = true) ||
+            Build.MODEL.contains("Emulator", ignoreCase = true) ||
+            Build.MODEL.contains("Android SDK built for", ignoreCase = true) ||
+            Build.HARDWARE.contains("goldfish", ignoreCase = true) ||
+            Build.HARDWARE.contains("ranchu", ignoreCase = true)
+
+    fun isQualcomm(): Boolean {
+        val soc = "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}"
+        return Regex("qualcomm|qcom|qti|snapdragon|sm[0-9]{4}|kalama|pineapple", RegexOption.IGNORE_CASE)
+            .containsMatchIn("$soc ${Build.HARDWARE} ${Build.BOARD} ${Build.DEVICE}")
     }
 }

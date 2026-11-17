@@ -35,7 +35,13 @@ android {
 
     packagingOptions {
         jniLibs {
+            // Extract native libraries to disk: Ollama's helper executables
+            // (lib*_exec.so) can only be run from the extracted lib directory.
             useLegacyPackaging true
+            // Only 64-bit ARM: every Android 15 phone is arm64 and the bundled
+            // Ollama/llama.cpp build targets it (ollama-android/build.sh).
+            // Flutter's plugin overrides abiFilters, so exclude the others here.
+            excludes += ['lib/armeabi-v7a/**', 'lib/x86/**', 'lib/x86_64/**']
         }
     }
 

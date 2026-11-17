@@ -117,9 +117,6 @@ open class MainActivity: FlutterActivity() {
                     val rpcServers = call.argument<String>("rpcServers") ?: ""
                     val multimodalBackendDevice =
                         call.argument<String>("multimodalBackendDevice") ?: ""
-                    val synergyCpuPercent = call.argument<Int>("synergyCpuPercent") ?: 50
-                    val synergyGpuPercent = call.argument<Int>("synergyGpuPercent") ?: 50
-                    val synergyNpuPercent = call.argument<Int>("synergyNpuPercent") ?: 0
                     val intent = Intent(this, OllamaServerService::class.java).apply {
                         putExtra("maxLoadedModels", maxLoadedModels)
                         putExtra("exposeToLan", exposeToLan)
@@ -128,9 +125,6 @@ open class MainActivity: FlutterActivity() {
                         putExtra("forceCpuSafe", forceCpuSafe)
                         putExtra("rpcServers", rpcServers)
                         putExtra("multimodalBackendDevice", multimodalBackendDevice)
-                        putExtra("synergyCpuPercent", synergyCpuPercent)
-                        putExtra("synergyGpuPercent", synergyGpuPercent)
-                        putExtra("synergyNpuPercent", synergyNpuPercent)
                     }
                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                         startForegroundService(intent)

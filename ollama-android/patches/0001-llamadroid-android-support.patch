@@ -1,0 +1,589 @@
+From 5c4f9f234db862b31f9bcf67fbecb444a85b655e Mon Sep 17 00:00:00 2001
+From: fernando433566 <fernandoblancosanchez08@gmail.com>
+Date: Tue, 17 Nov 2026 17:59:24 +0100
+Subject: [PATCH] Llamadroid: Android support patches
+
+- Run helper binaries packaged as JNI libraries (lib*_exec.so)
+- Look for native libraries next to the binary on Android
+- Treat Android GPUs as integrated (shared RAM)
+- Recognize llama.cpp's OpenCL backend (Qualcomm Adreno)
+- Default to performance cores only on big.LITTLE phone CPUs
+- Synergy mode: split layers between CPU and GPU
+- Retry once on CPU when an Android GPU load fails
+- OLLAMA_RPC_SERVERS: offload layers to other devices via ggml RPC
+- load_vision=false to skip the vision projector
+- reasoning_budget option (default -1 = unlimited)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ api/types.go                                |  7 +-
+ discover/llama_server.go                    |  3 +
+ discover/llama_server_llamadroid_test.go    | 21 ++++++
+ discover/vulkan.go                          | 18 ++++-
+ llm/llama_binary.go                         | 11 +++
+ llm/llama_server.go                         | 15 +++-
+ llm/llama_server_rpc.go                     | 36 ++++++++++
+ llm/llama_server_rpc_test.go                | 39 +++++++++++
+ llm/llama_server_threads_llamadroid.go      | 65 +++++++++++++++++
+ llm/llama_server_threads_llamadroid_test.go | 24 +++++++
+ ml/path.go                                  |  5 ++
+ server/sched.go                             | 11 ++-
+ server/sched_llamadroid.go                  | 78 +++++++++++++++++++++
+ server/sched_llamadroid_test.go             | 30 ++++++++
+ 14 files changed, 359 insertions(+), 4 deletions(-)
+ create mode 100644 discover/llama_server_llamadroid_test.go
+ create mode 100644 llm/llama_server_rpc.go
+ create mode 100644 llm/llama_server_rpc_test.go
+ create mode 100644 llm/llama_server_threads_llamadroid.go
+ create mode 100644 llm/llama_server_threads_llamadroid_test.go
+ create mode 100644 server/sched_llamadroid.go
+ create mode 100644 server/sched_llamadroid_test.go
+
+diff --git a/api/types.go b/api/types.go
+index 1c36d86b..a37587f4 100644
+--- a/api/types.go
++++ b/api/types.go
+@@ -699,6 +699,7 @@ type Options struct {
+ 	NumKeep          int      `json:"num_keep,omitempty"`
+ 	Seed             int      `json:"seed,omitempty"`
+ 	NumPredict       int      `json:"num_predict,omitempty"`
++	ReasoningBudget  int      `json:"reasoning_budget,omitempty"` // Llamadroid: max thinking tokens, -1 = unlimited
+ 	TopK             int      `json:"top_k,omitempty"`
+ 	TopP             float32  `json:"top_p,omitempty"`
+ 	MinP             float32  `json:"min_p,omitempty"`
+@@ -720,6 +721,9 @@ type Runner struct {
+ 	UseMMap         *bool `json:"use_mmap,omitempty"`
+ 	NumThread       int   `json:"num_thread,omitempty"`
+ 	DraftNumPredict int   `json:"draft_num_predict,omitempty"`
++	// LoadVision (Llamadroid) set to false skips loading the multimodal
++	// projector, saving memory until a request actually contains an image.
++	LoadVision *bool `json:"load_vision,omitempty"`
+ }
+ 
+ // SystemOneRequest is the request passed to [Client.SystemOne]. It asks a
+@@ -1341,7 +1345,8 @@ func (opts *Options) FromMap(m map[string]any) error {
+ func DefaultOptions() Options {
+ 	return Options{
+ 		// options set on request to runner
+-		NumPredict: -1,
++		NumPredict:      -1,
++		ReasoningBudget: -1, // Llamadroid: unlimited thinking unless the client asks for less
+ 
+ 		// set a minimal num_keep to avoid issues on context shifts
+ 		NumKeep:          4,
+diff --git a/discover/llama_server.go b/discover/llama_server.go
+index ba8ace58..205ed8fe 100644
+--- a/discover/llama_server.go
++++ b/discover/llama_server.go
+@@ -472,6 +472,9 @@ func inferLibrary(name, description string) string {
+ 		return "Metal"
+ 	case strings.Contains(combined, "vulkan"):
+ 		return "Vulkan"
++	case strings.Contains(combined, "opencl"):
++		// Llamadroid: llama.cpp's OpenCL backend, used for Qualcomm Adreno GPUs.
++		return "OpenCL"
+ 	default:
+ 		return description
+ 	}
+diff --git a/discover/llama_server_llamadroid_test.go b/discover/llama_server_llamadroid_test.go
+new file mode 100644
+index 00000000..07b0f54b
+--- /dev/null
++++ b/discover/llama_server_llamadroid_test.go
+@@ -0,0 +1,21 @@
++package discover
++
++import "testing"
++
++// Output of `llama-server --list-devices` on a Galaxy Z Flip5 (Snapdragon 8 Gen 2).
++func TestParseAndroidAdrenoDevices(t *testing.T) {
++	output := "Available devices:\n" +
++		"  Vulkan0: Adreno (TM) 740 (7429 MiB, 7429 MiB free)\n" +
++		"  GPUOpenCL: QUALCOMM Adreno(TM) (3586 MiB, 2562 MiB free)\n"
++
++	devices := parseLlamaServerDevicesWithNative(output, "", nil, nil)
++	if len(devices) != 2 {
++		t.Fatalf("got %d devices, want 2", len(devices))
++	}
++	if got := devices[1].Library; got != "OpenCL" {
++		t.Errorf("GPUOpenCL library = %q, want OpenCL", got)
++	}
++	if got := devices[1].FreeMemory; got != 2562*1024*1024 {
++		t.Errorf("GPUOpenCL free memory = %d, want %d", got, 2562*1024*1024)
++	}
++}
+diff --git a/discover/vulkan.go b/discover/vulkan.go
+index 5d481edd..e7f6a175 100644
+--- a/discover/vulkan.go
++++ b/discover/vulkan.go
+@@ -52,7 +52,23 @@ var probeLlamaServerVulkanDevices = func(_ []string) ([]vulkanPhysicalDevice, er
+ 
+ func refineLlamaServerDevices(devices []ml.DeviceInfo, libDirs []string) []ml.DeviceInfo {
+ 	devices = refineLinuxROCmDevices(devices)
+-	return refineWindowsVulkanDevices(devices, libDirs)
++	devices = refineWindowsVulkanDevices(devices, libDirs)
++	return refineAndroidDevices(devices)
++}
++
++// refineAndroidDevices (Llamadroid) marks every phone GPU as integrated:
++// Adreno and Mali share the system RAM with the CPU, whether they are driven
++// through Vulkan or OpenCL.
++func refineAndroidDevices(devices []ml.DeviceInfo) []ml.DeviceInfo {
++	if runtime.GOOS != "android" {
++		return devices
++	}
++
++	for i := range devices {
++		devices[i].Integrated = true
++	}
++
++	return devices
+ }
+ 
+ func refineWindowsVulkanDevices(devices []ml.DeviceInfo, libDirs []string) []ml.DeviceInfo {
+diff --git a/llm/llama_binary.go b/llm/llama_binary.go
+index 21087523..947eca7b 100644
+--- a/llm/llama_binary.go
++++ b/llm/llama_binary.go
+@@ -93,6 +93,11 @@ func llamaCppBinaryCandidates(name string, search llamaCppBinarySearch) []string
+ 			add(filepath.Join(base, "lib", "ollama"))
+ 			// Standard CMake installs put ollama.exe in bin/ and helpers in ../lib/ollama/.
+ 			add(filepath.Join(base, "..", "lib", "ollama"))
++		case "android":
++			// Android apps keep native libraries in the same dir as the binary or a 'lib' peer
++			add(base)
++			add(filepath.Join(base, "lib"))
++			add(filepath.Join(base, "..", "lib"))
+ 		default:
+ 			add(filepath.Join(base, "lib", "ollama"))
+ 			add(filepath.Join(base, "..", "lib", "ollama"))
+@@ -149,6 +154,12 @@ func llamaCppBinaryName(name, goos string) string {
+ 	if goos == "windows" && filepath.Ext(name) == "" {
+ 		return name + ".exe"
+ 	}
++	if goos == "android" && filepath.Ext(name) == "" {
++		// Android 10+ blocks execution from writable app data. Packaging helper
++		// executables as JNI libraries keeps them in the executable native library
++		// directory selected by PackageManager for the device ABI.
++		return "lib" + strings.ReplaceAll(name, "-", "_") + "_exec.so"
++	}
+ 	return name
+ }
+ 
+diff --git a/llm/llama_server.go b/llm/llama_server.go
+index fbff1c96..dd57df8b 100644
+--- a/llm/llama_server.go
++++ b/llm/llama_server.go
+@@ -416,6 +416,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
+ 	params = appendDraftArgs(params, launch.draftType, launch.config.DraftModelPath, launch.opts)
+ 
+ 	params = append(params, qwenVLServerArgs(launch.modelArch)...)
++	params = appendRPCArgs(params, os.Getenv("OLLAMA_RPC_SERVERS")) // Llamadroid: device cluster
+ 
+ 	for _, adapter := range launch.adapters {
+ 		slog.Warn("LoRA adapters are deprecated and will be removed in a future release", "adapter", adapter)
+@@ -447,6 +448,8 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
+ 	// Default behavior: let llama-server auto-detect.
+ 	if launch.opts.NumThread > 0 {
+ 		params = append(params, "-t", strconv.Itoa(launch.opts.NumThread))
++	} else if n := androidDefaultThreads(); n > 0 { // Llamadroid: skip little cores
++		params = append(params, "-t", strconv.Itoa(n))
+ 	}
+ 
+ 	params = appendMainGPUArgs(params, launch.opts)
+@@ -953,7 +956,13 @@ func NewLlamaServerRunner(
+ 		"nemotron_h_omni": true,
+ 		// Add entries as llama/compat grows clip handlers.
+ 	}
+-	if len(projectors) == 0 &&
++	// Llamadroid: load_vision=false skips the vision projector, which can
++	// reserve several GiB of RAM even for text-only chats on a phone.
++	skipVision := opts.LoadVision != nil && !*opts.LoadVision
++	if skipVision {
++		projectors = nil
++	}
++	if len(projectors) == 0 && !skipVision &&
+ 		len(f.Tensors().Items("v.")) > 0 &&
+ 		compatClipArches[arch] {
+ 		projectors = []string{modelPath}
+@@ -2343,6 +2352,10 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
+ 		"typical_p":         req.Options.TypicalP,
+ 		"seed":              req.Options.Seed,
+ 	}
++	// Llamadroid: -1 (the default) means "no limit", 0 answers without thinking.
++	if req.Options.ReasoningBudget >= 0 {
++		body["thinking_budget_tokens"] = req.Options.ReasoningBudget
++	}
+ 	if len(req.Tools) > 0 {
+ 		body["tools"] = req.Tools
+ 	}
+diff --git a/llm/llama_server_rpc.go b/llm/llama_server_rpc.go
+new file mode 100644
+index 00000000..5521cbcc
+--- /dev/null
++++ b/llm/llama_server_rpc.go
+@@ -0,0 +1,36 @@
++// Llamadroid: lets several phones work as one "device cluster". Other devices
++// run ggml-rpc-server and this phone hands part of the model to them through
++// llama.cpp's RPC backend.
++
++package llm
++
++import (
++	"net"
++	"strconv"
++	"strings"
++)
++
++// appendRPCArgs adds "--rpc host:port,host:port" to the llama-server command
++// line from a comma separated list (the OLLAMA_RPC_SERVERS variable).
++//
++// Invalid entries are skipped instead of failing, so an old or mistyped
++// worker address saved in the app never stops local models from loading.
++func appendRPCArgs(params []string, raw string) []string {
++	var endpoints []string
++	for _, candidate := range strings.Split(raw, ",") {
++		host, port, err := net.SplitHostPort(strings.TrimSpace(candidate))
++		if err != nil || strings.TrimSpace(host) == "" {
++			continue
++		}
++		portNumber, err := strconv.Atoi(port)
++		if err != nil || portNumber < 1 || portNumber > 65535 {
++			continue
++		}
++		endpoints = append(endpoints, net.JoinHostPort(host, port))
++	}
++
++	if len(endpoints) == 0 {
++		return params
++	}
++	return append(params, "--rpc", strings.Join(endpoints, ","))
++}
+diff --git a/llm/llama_server_rpc_test.go b/llm/llama_server_rpc_test.go
+new file mode 100644
+index 00000000..47ede1f0
+--- /dev/null
++++ b/llm/llama_server_rpc_test.go
+@@ -0,0 +1,39 @@
++package llm
++
++import (
++	"slices"
++	"testing"
++)
++
++func TestAppendRPCArgs(t *testing.T) {
++	tests := []struct {
++		name string
++		raw  string
++		want []string
++	}{
++		{name: "disabled", raw: "", want: []string{"base"}},
++		{
++			name: "valid workers",
++			raw:  "192.168.1.20:50052, worker.local:6000",
++			want: []string{"base", "--rpc", "192.168.1.20:50052,worker.local:6000"},
++		},
++		{
++			name: "invalid entries are ignored",
++			raw:  "missing-port,host:0,host:70000,10.0.0.3:50052",
++			want: []string{"base", "--rpc", "10.0.0.3:50052"},
++		},
++		{
++			name: "ipv6",
++			raw:  "[fd00::42]:50052",
++			want: []string{"base", "--rpc", "[fd00::42]:50052"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := appendRPCArgs([]string{"base"}, tt.raw); !slices.Equal(got, tt.want) {
++				t.Fatalf("appendRPCArgs() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/llm/llama_server_threads_llamadroid.go b/llm/llama_server_threads_llamadroid.go
+new file mode 100644
+index 00000000..0cf036a3
+--- /dev/null
++++ b/llm/llama_server_threads_llamadroid.go
+@@ -0,0 +1,65 @@
++// Llamadroid: pick a sensible thread count on phones.
++//
++// Phone CPUs mix fast and slow cores (big.LITTLE). llama.cpp uses one thread
++// per core by default, so the slow cores hold everyone back: on a Snapdragon
++// 8 Gen 2, 8 threads generate ~10 tok/s while 4 threads reach ~16-28 tok/s.
++
++package llm
++
++import (
++	"os"
++	"path/filepath"
++	"runtime"
++	"strconv"
++	"strings"
++)
++
++// androidDefaultThreads returns the number of threads to use on Android, or 0
++// to keep llama.cpp's default (other platforms, or when it cannot tell).
++func androidDefaultThreads() int {
++	if runtime.GOOS != "android" {
++		return 0
++	}
++	return performanceThreads(readCoreMaxFrequencies("/sys/devices/system/cpu"))
++}
++
++// performanceThreads counts the cores that are not in the slowest cluster and
++// keeps one of them free for Android and the app's UI.
++func performanceThreads(maxFreqs []int) int {
++	if len(maxFreqs) == 0 {
++		return 0
++	}
++
++	slowest := maxFreqs[0]
++	for _, f := range maxFreqs {
++		slowest = min(slowest, f)
++	}
++
++	fast := 0
++	for _, f := range maxFreqs {
++		if f > slowest {
++			fast++
++		}
++	}
++	if fast == 0 {
++		// All cores are the same: use all but one.
++		fast = len(maxFreqs)
++	}
++	return max(fast-1, 1)
++}
++
++// readCoreMaxFrequencies reads cpuN/cpufreq/cpuinfo_max_freq for every core.
++func readCoreMaxFrequencies(cpuDir string) []int {
++	paths, _ := filepath.Glob(filepath.Join(cpuDir, "cpu[0-9]*", "cpufreq", "cpuinfo_max_freq"))
++	var freqs []int
++	for _, path := range paths {
++		data, err := os.ReadFile(path)
++		if err != nil {
++			continue
++		}
++		if f, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
++			freqs = append(freqs, f)
++		}
++	}
++	return freqs
++}
+diff --git a/llm/llama_server_threads_llamadroid_test.go b/llm/llama_server_threads_llamadroid_test.go
+new file mode 100644
+index 00000000..a0918f80
+--- /dev/null
++++ b/llm/llama_server_threads_llamadroid_test.go
+@@ -0,0 +1,24 @@
++package llm
++
++import "testing"
++
++func TestPerformanceThreads(t *testing.T) {
++	tests := []struct {
++		name  string
++		freqs []int
++		want  int
++	}{
++		{name: "unknown", freqs: nil, want: 0},
++		// Snapdragon 8 Gen 2: 3x A510, 4x A715/A710, 1x X3
++		{name: "snapdragon 8 gen 2", freqs: []int{2016000, 2016000, 2016000, 2803200, 2803200, 2803200, 2803200, 3360000}, want: 4},
++		{name: "all cores equal", freqs: []int{2000000, 2000000, 2000000, 2000000}, want: 3},
++		{name: "single core", freqs: []int{1800000}, want: 1},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := performanceThreads(tt.freqs); got != tt.want {
++				t.Fatalf("performanceThreads() = %d, want %d", got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/ml/path.go b/ml/path.go
+index 83233b95..0c5d6c6d 100644
+--- a/ml/path.go
++++ b/ml/path.go
+@@ -88,6 +88,11 @@ func libOllamaPathCandidates(search libOllamaPathSearch) []string {
+ 		case "windows":
+ 			add(filepath.Join(exeDir, "lib", "ollama"))
+ 			add(filepath.Join(exeDir, "..", "lib", "ollama"))
++		case "android":
++			// Android apps keep native libraries in the same dir as the binary or a 'lib' peer
++			add(exeDir)
++			add(filepath.Join(exeDir, "lib"))
++			add(filepath.Join(exeDir, "..", "lib"))
+ 		default:
+ 			add(filepath.Join(exeDir, "lib", "ollama"))
+ 			add(filepath.Join(exeDir, "..", "lib", "ollama"))
+diff --git a/server/sched.go b/server/sched.go
+index e8384623..fcc35b5b 100644
+--- a/server/sched.go
++++ b/server/sched.go
+@@ -42,6 +42,10 @@ type LlmRequest struct {
+ 	// evict-all-and-retry. Prevents infinite retry on persistent load failures.
+ 	oomRetryAttempted bool
+ 
++	// gpuFallbackAttempted is set after one Android GPU load failed and the
++	// request was retried on CPU (Llamadroid, see sched_llamadroid.go).
++	gpuFallbackAttempted bool
++
+ 	// numCtxAuto is true when NumCtx came from Ollama's automatic VRAM-tier
+ 	// default rather than explicit request, model, or environment config.
+ 	numCtxAuto bool
+@@ -361,7 +365,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
+ 					// every unload, then loop back to retry the load once.
+ 					// load() has already set oomRetryAttempted so a second
+ 					// crash falls through to the fail-fast path.
+-					if pending.oomRetryAttempted {
++					if pending.oomRetryAttempted || pending.gpuFallbackAttempted {
+ 						if !s.evictAllAndWait(ctx, pendingKey) {
+ 							return
+ 						}
+@@ -569,6 +573,8 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+ 				return false
+ 			}
+ 
++			applyAndroidSynergyLayers(req, f) // Llamadroid: CPU/GPU split mode
++
+ 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+ 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+ 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
+@@ -706,6 +712,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+ 			slog.Warn("llama-server load failed; evicting all other models and retrying once", "model", req.model.ModelPath, "error", err)
+ 			return true
+ 		}
++		if retryAndroidLoadOnCPU(req, loadGpus, err) { // Llamadroid: Vulkan driver fallback
++			return true
++		}
+ 
+ 		req.errCh <- err
+ 		return false
+diff --git a/server/sched_llamadroid.go b/server/sched_llamadroid.go
+new file mode 100644
+index 00000000..82d5a0fd
+--- /dev/null
++++ b/server/sched_llamadroid.go
+@@ -0,0 +1,78 @@
++// Llamadroid: scheduler behaviour that only applies when Ollama runs inside
++// the Android app. Everything here is a no-op on other platforms, so the
++// upstream scheduler keeps working unchanged on desktop builds.
++
++package server
++
++import (
++	"log/slog"
++	"runtime"
++
++	"github.com/ollama/ollama/fs/gguf"
++	"github.com/ollama/ollama/ml"
++)
++
++// Synergy mode lets the user pick "X % of the layers on the GPU, the rest on
++// the CPU". The Android app has no extra API field for this, so it encodes
++// the percentage in num_gpu:
++//
++//	num_gpu = -1000 - gpuPercent      (gpuPercent in 0..100)
++//
++// so -1000 means 0 % GPU (all CPU) and -1100 means 100 % GPU.
++const (
++	synergyEncodedMin = -1100 // 100 % GPU
++	synergyEncodedMax = -1000 // 0 % GPU
++)
++
++// androidSynergyGPULayers decodes a Synergy num_gpu value into the number of
++// layers to offload. ok is false when encoded is a normal num_gpu value.
++func androidSynergyGPULayers(encoded, totalLayers int) (gpuPercent, gpuLayers int, ok bool) {
++	if encoded > synergyEncodedMax || encoded < synergyEncodedMin || totalLayers < 0 {
++		return 0, 0, false
++	}
++
++	gpuPercent = synergyEncodedMax - encoded
++	gpuLayers = (totalLayers*gpuPercent + 50) / 100 // rounded to the nearest layer
++	return gpuPercent, min(max(gpuLayers, 0), totalLayers), true
++}
++
++// applyAndroidSynergyLayers replaces an encoded Synergy num_gpu with the real
++// layer count before Ollama plans the model placement.
++func applyAndroidSynergyLayers(req *LlmRequest, f *gguf.Model) {
++	if runtime.GOOS != "android" {
++		return
++	}
++
++	totalLayers := int(f.KV().BlockCount() + 1) // +1 for the output layer
++	gpuPercent, gpuLayers, ok := androidSynergyGPULayers(req.opts.NumGPU, totalLayers)
++	if !ok {
++		return
++	}
++
++	req.opts.NumGPU = gpuLayers
++	slog.Info("android synergy mode: splitting layers between CPU and GPU",
++		"model", req.model.ModelPath,
++		"gpu_percent", gpuPercent,
++		"gpu_layers", gpuLayers,
++		"total_layers", totalLayers)
++}
++
++// retryAndroidLoadOnCPU decides whether a failed load should be retried once
++// on the CPU. Mobile Vulkan drivers differ a lot between phones, so the GPU is
++// always tried first, but a driver crash should not make the model unusable.
++//
++// It only triggers for automatic placement (num_gpu < 0): if the user asked
++// for a specific number of GPU layers we respect that and report the error.
++func retryAndroidLoadOnCPU(req *LlmRequest, loadGpus []ml.DeviceInfo, err error) bool {
++	if runtime.GOOS != "android" || len(loadGpus) == 0 || req.opts.NumGPU >= 0 || req.gpuFallbackAttempted {
++		return false
++	}
++
++	req.gpuFallbackAttempted = true
++	req.opts.NumGPU = 0
++	slog.Warn("android GPU load failed; retrying once on CPU",
++		"model", req.model.ModelPath,
++		"gpu_library", loadGpus[0].Library,
++		"error", err)
++	return true
++}
+diff --git a/server/sched_llamadroid_test.go b/server/sched_llamadroid_test.go
+new file mode 100644
+index 00000000..2b95478a
+--- /dev/null
++++ b/server/sched_llamadroid_test.go
+@@ -0,0 +1,30 @@
++package server
++
++import "testing"
++
++func TestAndroidSynergyGPULayers(t *testing.T) {
++	tests := []struct {
++		name        string
++		encoded     int
++		totalLayers int
++		wantPercent int
++		wantLayers  int
++		wantOK      bool
++	}{
++		{name: "normal num_gpu is ignored", encoded: -1, totalLayers: 25},
++		{name: "all on cpu", encoded: -1000, totalLayers: 25, wantPercent: 0, wantLayers: 0, wantOK: true},
++		{name: "half", encoded: -1050, totalLayers: 25, wantPercent: 50, wantLayers: 13, wantOK: true},
++		{name: "all on gpu", encoded: -1100, totalLayers: 25, wantPercent: 100, wantLayers: 25, wantOK: true},
++		{name: "out of range", encoded: -1101, totalLayers: 25},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			percent, layers, ok := androidSynergyGPULayers(tt.encoded, tt.totalLayers)
++			if ok != tt.wantOK || percent != tt.wantPercent || layers != tt.wantLayers {
++				t.Fatalf("got (%d, %d, %v), want (%d, %d, %v)",
++					percent, layers, ok, tt.wantPercent, tt.wantLayers, tt.wantOK)
++			}
++		})
++	}
++}
+-- 
+2.56.1
+
